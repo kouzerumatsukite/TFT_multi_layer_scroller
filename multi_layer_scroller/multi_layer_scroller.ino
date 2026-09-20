@@ -28,12 +28,17 @@ static uint16_t lineBuffer[BUFFER_SIZE];
 
 static bool double_buffer = DOUBLE_BUFFER;
 static bool interlace = INTERLACE;
+static bool enable_batching = true;
+static bool enable_skipping = true;
+static bool enable_occlusion = true;
 static uint32_t framerate = FRAMERATE;
 static uint32_t debug_mode = 0;
-// 0: visualize normal
-// 1: visualize overdraw
-// 2: visualize skipped pixels hierarchy
-// 3: visualize unique vs clone tile render
+// 1: visualize normal
+// 2: visualize overdraw
+// 3: visualize skipped pixels hierarchy
+// 4: visualize unique vs clone tile render
+// 5: visualize depthmap
+// 6: grayscale mode
 
 
 
@@ -125,7 +130,8 @@ void renderLayers() {
     }
 
     // Stage 2, iterate each layer for heuristical rendering
-    for (unsigned int l = 0; l < 4; l++){
+    for (unsigned int L = 0; L < 4; L++){
+      unsigned int l = enable_occlusion ? 3-L : L;
       if( !layers[l].visible ){ continue; }
       const struct tilemap *map = layers[l].mapData;
       const uint16_t *tsColors = map->tileset->colors;
@@ -137,7 +143,7 @@ void renderLayers() {
       for(unsigned int i = 0; i < (TILES_SCREEN_WIDTH+3)/4; i++){
         uint32_t*tilesChunk = (uint32_t*)&tileChunksRow[l][i];
         // check for 64 pixels (or 4 tiles) skip
-        if(!*tilesChunk){ bufferX += 64; continue; }
+        if(!*tilesChunk){ if(enable_skipping) { bufferX += 64; continue; } }
         if(debug_mode==2){
           for(int z = 0; z < 64; z++){
             bufferX[z]  |= 
@@ -150,7 +156,7 @@ void renderLayers() {
         for(unsigned int j = 0; j < 4; j++ ){
           unsigned int tileID = rowCache[j];
           // check for 16 pixels (or 1 tile) skip
-          if(!tileID){ bufferX += 16; continue; }
+          if(!tileID){ if(enable_skipping) { bufferX += 16; continue; } }
           if(debug_mode==2){
             for(int z = 0; z < 16; z++){
               bufferX[z]  |= 
@@ -166,7 +172,7 @@ void renderLayers() {
               fullRowCache[n] = 0;
               tileBatches[batchLen++] = p;
             }
-            //break; // put only one in the batch, for debug purposes
+            if (!enable_batching) break; // put only one in the batch, for debug purposes
           }
           unsigned int tileX = (tileID % 16)*16; // dword aligned
           unsigned int tileY = (tileID / 16)*16 + row_pos_off[l];
@@ -188,16 +194,32 @@ void renderLayers() {
             uint8_t *tsPixels = (uint8_t*)&pixelsChunk;
 
             if(!debug_mode){
-              for(unsigned int m = 0; m < 4; m++){
-                unsigned int pixel = tsPixels[m];
-                // check for 1 pixel skip
-                if(!pixel){ bufferX++; continue; }
-                unsigned int color = pgm_read_word(&tsColors[pixel]);
-                for(unsigned o = 0; o < batchLen; o++){
-                  bufferX[tileBatches[o]] = (color >> 8) | (color << 8);
+              if(!enable_occlusion){
+                for(unsigned int m = 0; m < 4; m++){
+                  unsigned int pixel = tsPixels[m];
+                  // check for 1 pixel skip
+                  if(!pixel){ bufferX++; continue; }
+                  unsigned int color = pgm_read_word(&tsColors[pixel]);
+                  for(unsigned o = 0; o < batchLen; o++){
+                    bufferX[tileBatches[o]] = (color >> 8) | (color << 8);
+                  }
+                  bufferX++;
                 }
-                bufferX++;
-              } 
+              }
+              else{
+                for(unsigned int m = 0; m < 4; m++){
+                  unsigned int pixel = tsPixels[m];
+                  // check for 1 pixel skip
+                  if(!pixel){ bufferX++; continue; }
+                  unsigned int color = pgm_read_word(&tsColors[pixel]);
+                  for(unsigned o = 0; o < batchLen; o++){
+                    if(!bufferX[tileBatches[o]]){
+                      bufferX[tileBatches[o]] = (color >> 8) | (color << 8);
+                    }
+                  }
+                  bufferX++;
+                }
+              }
             }
             else {
               for(unsigned int m = 0; m < 4; m++){
@@ -206,26 +228,53 @@ void renderLayers() {
                 if(!pixel){ bufferX++; continue; }
                 for(unsigned o = 0; o < batchLen; o++){
                   switch(debug_mode){
-                    case 1: bufferX[tileBatches[o]] |= 
-                      0b1110101101011010 * (l == 0) | // Layer 0 draw
-                      0b0000000010100000 * (l == 1) | // Layer 1 draw
-                      0b0000000000000101 * (l == 2) | // Layer 2 draw
-                      0b0001010000000000 * (l == 3) ; // Layer 3 draw
+                    case 1: ///////////////////////////// VISUALIZE OVERDRAW
+                      bufferX[tileBatches[o]] |= 0  |  // ------------------
+                      0b1110101101011010 * (l == 0) |  // Layer 0   overdraw
+                      0b0000000010100000 * (l == 1) |  // Layer 1   overdraw
+                      0b0000000000000101 * (l == 2) |  // Layer 2   overdraw
+                      0b0001010000000000 * (l == 3) ;  // Layer 3   overdraw
                       break;
-                    case 2: bufferX[tileBatches[o]] |=
-                      0b0000000010000000 * (l == 1) | // Layer 1 no skip pixel
-                      0b0000000000000100 * (l == 2) | // Layer 2 no skip pixel
-                      0b0001000000000000 * (l == 3) ; // Layer 3 no skip pixel
+                    case 2: ///////////////////////////// VISUALIZE  SKIP PIXEL
+                      bufferX[tileBatches[o]] |= 0  |  // ---------------------
+                      0b0000000010000000 * (l == 1) |  // Layer 1 no skip pixel
+                      0b0000000000000100 * (l == 2) |  // Layer 2 no skip pixel
+                      0b0001000000000000 * (l == 3) ;  // Layer 3 no skip pixel
                       break;
-                    case 3: bufferX[tileBatches[o]] |= o ? 
-                      0b1000001000010000 * (l == 0) | // Layer 0 unique tile color
-                      0b0000000001001000 * (l == 1) | // Layer 1 unique tile color
-                      0b0110000000000010 * (l == 2) | // Layer 2 unique tile color
-                      0b0000100100000000 * (l == 3) : // Layer 3 unique tile color
-                      0b0000010000100001 * (l == 0) | // Layer 0 clone batch color
-                      0b0000000010000000 * (l == 1) | // Layer 1 clone batch color
-                      0b0000000000000100 * (l == 2) | // Layer 2 clone batch color
-                      0b0001000000000000 * (l == 3) ; // Layer 3 clone batch color
+                    case 3: ///////////////////////////// VISUALIZE UNIQUE VS CLONE
+                      bufferX[tileBatches[o]] |= o  ?  // -------------------------
+                      0b1000001000010000 * (l == 0) |  // Layer 0 unique tile color
+                      0b0000000001001000 * (l == 1) |  // Layer 1 unique tile color
+                      0b0110000000000010 * (l == 2) |  // Layer 2 unique tile color
+                      0b0000100100000000 * (l == 3) :  // Layer 3 unique tile color
+                      0b0000010000100001 * (l == 0) |  // Layer 0 clone batch color
+                      0b0000000010000000 * (l == 1) |  // Layer 1 clone batch color
+                      0b0000000000000100 * (l == 2) |  // Layer 2 clone batch color
+                      0b0001000000000000 * (l == 3) ;  // Layer 3 clone batch color
+                      break;
+                    case 4: ///////////////////////////// VISUALIZE DEPTH
+                      if(!bufferX[tileBatches[o]]){
+                      bufferX[tileBatches[o]]    = 0  |  // ---------------
+                        0b0100010100101001 * (l == 0) |  // Layer 0 depth 1
+                        0b1010101001010010 * (l == 1) |  // Layer 1 depth 2
+                        0b1110111101111011 * (l == 2) |  // Layer 2 depth 3
+                        0b0101010110101101 * (l == 3) ;  // Layer 3 depth 4
+                      }
+                      break;
+                    case 5: ///////////////////////////// GRAYSCALE MODE
+                      if(!bufferX[tileBatches[o]]){
+                        unsigned int color = pgm_read_word(&tsColors[pixel]);
+                        unsigned int r_col = color >> 11           ; // 25.0% red
+                        unsigned int g_col = color >>  5 & 0b111111; // 50.0% green
+                        unsigned int b_col = color >>  1 & 0b001111; // 12.5% blue
+                        unsigned int gray  = r_col + g_col + b_col ; // sum all
+                        gray  = gray * 0b1001011;
+                        r_col = gray >> 8 << 11 ;
+                        g_col = gray >> 7 <<  5 ;
+                        b_col = gray >> 8       ;
+                        color = r_col | g_col | b_col ;
+                        bufferX[tileBatches[o]] = color >> 8 | color << 8 ;
+                      }
                       break;
                   }
                 }
@@ -235,6 +284,12 @@ void renderLayers() {
           }
         }
       }
+
+      // if occlusion enabled, prune the below layers
+      //if(enable_occlusion){
+      //  bufferX = &rowDest[startBufferX];
+
+      //}
       row_pos_off[l] += (1+interlace);
       if(row_pos_off[l] >= 16){
         row_pos_off[l] -= 16;
@@ -254,6 +309,7 @@ void renderLayers() {
 
 int64_t lastMillis;
 int64_t lastMillis2;
+int64_t lastMillis3;
 int64_t framecounts;
 
 void setup() {
@@ -274,27 +330,31 @@ void setup() {
 
 int cameraX = 0;
 int cameraY = 0;
+int scrollingX = 0;
+int scrollingY = 0;
 int cameraSpeed = 64;
+bool cameraAutoScroll = true;
 void loop() {
-  cameraY = 64-64*sinf(fmodf((float)cameraX/6400.f,(float)PI*2.f));
+  uint64_t millisDelta = millis() - lastMillis3;
+  lastMillis3 += millisDelta;
+  scrollingX += (cameraSpeed*millisDelta) / 25;
+  scrollingY = 1024-1024*sinf(fmodf((float)cameraX/6400.f,(float)PI*2.f));
+
+  if (cameraAutoScroll){
+    cameraX += ( scrollingX - cameraX ) / 5;
+    cameraY += ( scrollingY - cameraY ) / 10;
+  }
   // Example: Independently scroll each layer at different speeds (Parallax effect)
   layers[0].scrollX = cameraX / 128; // Layer 1 sky
-  layers[1].scrollX = cameraX / 64; // Layer 2 forests
-  layers[2].scrollX = cameraX / 16; // Layer 3 foreground 1 (grounds)
-  layers[3].scrollX = cameraX / 16; // Layer 4 foreground 2 (props)
-  layers[0].scrollY = cameraY / 8; // Layer 1 sky
-  layers[1].scrollY = cameraY / 4; // Layer 2 forests
-  layers[2].scrollY = cameraY ; // Layer 3 foreground 1 (grounds)
-  layers[3].scrollY = cameraY ; // Layer 4 foreground 2 (props)
+  layers[0].scrollY = cameraY / 128; // Layer 1 sky
+  layers[1].scrollX = cameraX /  64; // Layer 2 forests
+  layers[1].scrollY = cameraY /  64; // Layer 2 forests
+  layers[2].scrollX = cameraX /  16; // Layer 3 foreground 1 (grounds)
+  layers[2].scrollY = cameraY /  16; // Layer 3 foreground 1 (grounds)
+  layers[3].scrollX = cameraX /  16; // Layer 4 foreground 2 (props)
+  layers[3].scrollY = cameraY /  16; // Layer 4 foreground 2 (props)
 
   renderLayers();
-  
-  // Control frame rate / speed
-  GPOC=1; // CPU "idle" indicator
-  while ( lastMillis-millis()*framerate >= 0 ) delay(1);
-  while ( lastMillis-millis()*framerate <  0 ) lastMillis += 1000;
-  GPOS=1;
-  cameraX += cameraSpeed;
 
   framecounts++;
   if (millis()-lastMillis2 > 1000){
@@ -315,38 +375,100 @@ void loop() {
     uint32_t payload = incomingNumber % 1000;
 
     switch(command){
-      case 0:
-        debug_mode = payload < 4 ? payload : 0;
-        Serial.print("debug mode is adjusted to: ");
-        if (debug_mode == 0) Serial.println("visualize normal");
-        if (debug_mode == 1) Serial.println("visualize overdraw");
-        if (debug_mode == 2) Serial.println("visualize skipping pixels");
-        if (debug_mode == 3) Serial.println("visualize unique vs clone tile render");
-        break;
-      case 1:
-        if(payload < 4){
-          layers[payload].visible = !layers[payload].visible;
-          Serial.printf("layer %d is %s\n",payload,layers[payload].visible?"visible":"hidden");
+      case 0: // debug mode selector
+        if (payload > 0){
+          debug_mode = ( payload < 7 ? payload : 0 ) - 1;
+          Serial.print("debug mode is adjusted to: ");
+          if (debug_mode == 0) Serial.println("visualize normal");
+          if (debug_mode == 1) Serial.println("visualize overdraw");
+          if (debug_mode == 2) Serial.println("visualize skipping pixels");
+          if (debug_mode == 3) Serial.println("visualize unique vs clone tile render");
+          if (debug_mode == 4) Serial.println("visualize depthmap");
+          if (debug_mode == 5) Serial.println("gray scale mode");
         }
         break;
-      case 4:
+      case 1: // layer options
+        command = payload / 100;
+        payload = payload % 100;
+        if(payload < 4){
+          switch(command){
+            case 0 : layers[payload].visible = false; break; // set layer hidden
+            case 1 : layers[payload].visible = true; break; // set layer visible
+            default: layers[payload].visible = !layers[payload].visible; break; // toggle
+          }
+          
+        }
+        Serial.printf("layer %d is %s\n",payload,layers[payload].visible?"visible":"hidden");
+        break;
+      case 2: // tile engine rendering optimizations
+        command = payload / 100;
+        payload = payload % 100;
+        switch(command){
+          case 0: 
+            enable_skipping = payload & 1;
+            Serial.printf("enable_skipping is %s\n", enable_skipping ? "enabled":"disabled");
+            break;
+          case 1: 
+            enable_batching = payload & 1;
+            Serial.printf("enable_batching is %s\n", enable_batching ? "enabled":"disabled");
+            break;
+          case 2: 
+            enable_occlusion = payload & 1;
+            Serial.printf("enable_occlusion is %s\n", enable_occlusion ? "enabled":"disabled");
+            break;
+        }
+        break;
+      case 3: // screen rendering options
+        command = payload / 100;
+        payload = payload % 100;
+        switch(command){
+          case 0:
+            double_buffer = payload & 1 & DOUBLE_BUFFER;
+            Serial.printf("double_buffer is %s\n", double_buffer ? "enabled":"disabled");
+            break;
+          case 1:
+            interlace = payload & 1;
+            interleave = interleave & interlace;
+            Serial.printf("Interlace is %s\n", interlace ? "enabled":"disabled");
+            break;
+        }
+        break;
+      case 4: // framerate
         framerate = payload;
         lastMillis = millis()*framerate;
         Serial.printf("max framerate is adjusted to: %d\n", framerate);
         break;
-      case 5:
-        double_buffer = payload & 1 & DOUBLE_BUFFER;
-        Serial.printf("double_buffer is %s\n", double_buffer ? "enabled":"disabled");
-        break;
-      case 6:
-        interlace = payload & 1;
-        interleave = interleave & interlace;
-        Serial.printf("Interlace is %s\n", interlace ? "enabled":"disabled");
-        break;
-      case 7:
+      case 5: // camera speed
         cameraSpeed = payload % 1000;
         Serial.printf("Camera speed is adjusted to: %d\n", cameraSpeed);
         break;
+      case 6: // camera position X
+        cameraX = ( payload % 1000 ) * 64;
+        Serial.printf("Camera X is adjusted to: %d\n", cameraX);
+        break;
+      case 7: // camera position Y
+        cameraY = ( payload % 1000 ) * 64;
+        Serial.printf("Camera Y is adjusted to: %d\n", cameraY);
+        break;
+      case 8: // key events ( use python's pyserial or similar to send these commands using keyboard )
+        command = payload / 100;
+        payload = payload % 100;
+        switch(command){
+          // change camera positions
+          case 0: cameraX -= payload * 64; break;
+          case 1: cameraX += payload * 64; break;
+          case 2: cameraY -= payload * 64; break;
+          case 3: cameraY += payload * 64; break;
+          case 4: cameraAutoScroll ^= payload & 1; break;
+        }
+        break;
     }
   }
+  
+  
+  // Control frame rate / speed
+  GPOC=1; // CPU "idle" indicator
+  while ( lastMillis-millis()*framerate >= 0 ) delay(1);
+  while ( lastMillis-millis()*framerate <  0 ) lastMillis += 1000;
+  GPOS=1;
 }
