@@ -546,7 +546,10 @@ void loop() {
   layers[3].scrollX = cameraX /  16; // Layer 4 foreground 2 (props)
   layers[3].scrollY = cameraY /  16; // Layer 4 foreground 2 (props)
 
-  renderLayers();
+  if(!debug_enable)
+    renderLayers();
+  else
+    renderLayers_debug();
 
   framecounts++;
   if (millis()-lastMillis2 > 1000){
@@ -593,57 +596,65 @@ void loop() {
             case 2 : layers[payload].visible = true; break; // set layer visible
           }
           Serial.printf("layer %d is %s\n",payload,layers[payload].visible?"visible":"hidden");
-        }
-        if(payload < 4){
-          layers[0].visible = true;
-          layers[1].visible = true;
-          layers[2].visible = true;
-          layers[3].visible = true;
-          Serial.println("all layers is set to visible");
+        }else
+        {
+          if(payload < 4){
+            layers[0].visible = true;
+            layers[1].visible = true;
+            layers[2].visible = true;
+            layers[3].visible = true;
+            Serial.println("all layers is set to visible");
+          }
         }
         break;
       case 2: // tile engine rendering optimizations
         command = payload / 100;
         payload = payload % 100;
-        switch(command){
-          case 0: // reset options
-            enable_skipping = true;
-            enable_batching = true;
+
+        bool bool_options[3] = { enable_skipping, enable_batching, enable_occlusion };
+        char*name_options[3] = { "skipping", "batching", "occlussion" };
+
+        if(command<3){
+          switch(command){
+            case 0 : bool_options[payload] = !bool_options[payload]; //toggle
+            case 1 : bool_options[payload] = false; // disable option
+            case 2 : bool_options[payload] = true; // enable option
+          }
+          enable_skipping  = bool_options[0];
+          enable_batching  = bool_options[1];
+          enable_occlusion = bool_options[2];
+          Serial.printf("enable_%s is %s\n", name_options[payload], bool_options[payload] ? "enabled":"disabled");
+        }else
+        {
+          if(payload < 3){
+            enable_skipping  = true;
+            enable_batching  = true;
             enable_occlusion = true;
             Serial.println("tile skipping, batching, and occlusion is set to all enabled");
-            break;
-          case 1: 
-            enable_skipping = payload & 1;
-            Serial.printf("enable_skipping is %s\n", enable_skipping ? "enabled":"disabled");
-            break;
-          case 2: 
-            enable_batching = payload & 1;
-            Serial.printf("enable_batching is %s\n", enable_batching ? "enabled":"disabled");
-            break;
-          case 3: 
-            enable_occlusion = payload & 1;
-            Serial.printf("enable_occlusion is %s\n", enable_occlusion ? "enabled":"disabled");
-            break;
+          }
         }
         break;
       case 3: // screen rendering options
         command = payload / 100;
         payload = payload % 100;
-        switch(command){
-          case 0:
-            double_buffer = true;
+
+        bool bool_options[3] = { interlace, double_buffer };
+        char*name_options[3] = { "interlace", "double_buffer" };
+
+        if(command<3){
+          switch(command){
+            case 0 : bool_options[payload] = !bool_options[payload]; //toggle
+            case 1 : bool_options[payload] = false; // disable option
+            case 2 : bool_options[payload] = true; // enable option
+          }
+          Serial.printf("%s is %s\n", name_options[payload], bool_options[payload] ? "enabled":"disabled");
+        }else
+        {
+          if(payload < 2){
             interlace = true;
-            Serial.println("double_buffer and interlace is set to enabled");
-            break;
-          case 1:
-            interlace = payload & 1;
-            interleave = interleave & interlace;
-            Serial.printf("Interlace is %s\n", interlace ? "enabled":"disabled");
-            break;
-          case 2:
-            double_buffer = payload & 1 & DOUBLE_BUFFER;
-            Serial.printf("double_buffer is %s\n", double_buffer ? "enabled":"disabled");
-            break;
+            double_buffer = true;
+            Serial.println("interlace and double_buffer is set to all enabled");
+          }
         }
         break;
       case 4: // framerate
