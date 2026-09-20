@@ -607,7 +607,7 @@ void loop() {
           }
         }
         break;
-      case 2: // tile engine rendering optimizations
+      case 2: { // tile engine rendering optimizations
         command = payload / 100;
         payload = payload % 100;
 
@@ -634,7 +634,8 @@ void loop() {
           }
         }
         break;
-      case 3: // screen rendering options
+      }
+      case 3: { // screen rendering options
         command = payload / 100;
         payload = payload % 100;
 
@@ -657,6 +658,7 @@ void loop() {
           }
         }
         break;
+      }
       case 4: // framerate
         framerate = std::max(payload,(unsigned int)1);
         lastMillis = millis()*framerate;
