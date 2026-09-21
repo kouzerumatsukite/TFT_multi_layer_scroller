@@ -1,6 +1,8 @@
 # ESP8266 Multi-Layer Parallax Engine
 
-A high-performance, tile-based 2D rendering engine built specifically for the ESP8266 (80MHz). It achieves a stable 25–35 FPS while pushing four simultaneous layers of independent parallax scrolling to a 320x240 SPI TFT display using 16-bit color (RGB565).
+A high-performance, tile-based 2D rendering engine built for ESP8266, can be compiled for ESP32 or RP2060. It achieves a stable 25–35 FPS (ESP8266 @160MHz) while pushing four simultaneous layers of independent parallax scrolling to a 320x240 SPI TFT display using 16-bit color (RGB565).
+
+https://github.com/user-attachments/assets/c29ea7c5-c16b-4343-80fd-1d8297859b68
 
 The engine is heavily optimized for low-resource microcontrollers, utilizing aggressive spatial caching, bit-shifting math, and run-time occlusion culling to minimize SPI bandwidth and CPU overhead.
 
