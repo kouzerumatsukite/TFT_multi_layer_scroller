@@ -147,7 +147,9 @@ void renderLayers_debug() {
           rowTilesCopy[col] = 0;
       }
       // Mark the flag all opaque of all rowTiles first
-      tileBools[l] = (l==3);
+      tileBools[l] = (l == 3)
+      ? ((1UL << TILES_SCREEN_WIDTH) - 1)
+      : 0;
     }
 
     // Stage 2, iterate each layer for heurestical rendering
@@ -492,7 +494,9 @@ void renderLayers(){
           rowTilesCopy[col] = 0;
       }
       // Mark the flag all opaque of all rowTiles first
-      tileBools[l] = (l==3);
+      tileBools[l] = (l == 3)
+      ? ((1UL << TILES_SCREEN_WIDTH) - 1)
+      : 0;
     }
 
     // Stage 2, iterate each layer for heurestical rendering
