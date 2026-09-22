@@ -17,14 +17,19 @@ TFT_eSPI tft = TFT_eSPI(); // Invoke library
 // Target screen dimensions (e.g., 240x320)
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 240
+#define ORIENTATION 1
 
 #define DOUBLE_BUFFER 1
 #define INTERLACE 1
 #define FRAMERATE 60
 
-#define BUFFER_SIZE (SCREEN_WIDTH + 16) * (1 + DOUBLE_BUFFER)
+// --- AUTOMATIC BUFFER CALCULATION ---
+// Calculate max possible tiles, round up to nearest 4-tile chunk, and convert to pixels
+#define TILES_ACROSS ((SCREEN_WIDTH + 30) / 16)
+#define CHUNKS_ACROSS ((TILES_ACROSS + 3) / 4)
+#define BUFFER_SIZE ((CHUNKS_ACROSS * 64) + 16)
 // Spare 16 pixels for fast tiles blitting with scrolling offset
-static uint16_t lineBuffer[BUFFER_SIZE];
+static uint16_t lineBuffer[BUFFER_SIZE * (1 + DOUBLE_BUFFER)];
 
 static bool double_buffer = DOUBLE_BUFFER;
 static bool interlace = INTERLACE;
@@ -37,8 +42,9 @@ static uint32_t debug_mode = 0;
 // 2: visualize overdraw
 // 3: visualize skipped pixels hierarchy
 // 4: visualize unique vs clone tile render
-// 5: visualize depthmap
-// 6: grayscale mode
+// 5: visualize fastpath
+// 6: visualize depthmap
+// 7: grayscale mode
 static uint32_t framerate = FRAMERATE;
 
 
@@ -68,165 +74,12 @@ uint8_t buffer_flip = 0;
 // 17 pixels = 3 tiles
 // 32 pixels = 3 tiles
 // 33 pixels = 4 tiles
-unsigned int TILES_SCREEN_WIDTH = ( SCREEN_WIDTH + 30 ) / 16;
+static constexpr unsigned int TILES_SCREEN_WIDTH = TILES_ACROSS;
 
-void renderLayers() {
-  // Tile state caching for fast accesses
-  unsigned int row_pos_blk[4]; // - Current row tile block position
-  unsigned int row_pos_off[4]; // - Current row tile pixel offset
-  unsigned int col_pos_blk[4]; // - Column start tile block position
-  unsigned int col_pos_off[4]; // - Column start tile pixel offset
-
-  unsigned int last_row_pos_blk[4];
-
-  // Tile ID caching for rendering current row
-  // Aligned to DWORD size for fast heuristical comparison
-  unsigned int tileChunksRowOriginal[4][(TILES_SCREEN_WIDTH+3)/4];
-  // Copy of it because constantly modified during rendering
-  unsigned int tileChunksRow[4][(TILES_SCREEN_WIDTH+3)/4];
-  // For Dynamic Batching
-  unsigned int tileBatches[TILES_SCREEN_WIDTH];
-
-  // Iterate each layer to get their states, calculated only once
-  for (unsigned int l = 0; l < 4; l++){
-    const struct tilemap *map = layers[l].mapData;
-    // mapWorldPos = scrollPos % mapSize
-    unsigned int mapWorldY = ( layers[l].scrollY + interleave ) % (map->height * 16);
-    unsigned int mapWorldX = layers[l].scrollX % (map->width * 16);
-    // split tile block and pixel offset position
-    row_pos_blk[l] = mapWorldY / 16;
-    row_pos_off[l] = mapWorldY % 16;
-    col_pos_blk[l] = mapWorldX / 16;
-    col_pos_off[l] = mapWorldX % 16;
-    // tileID caching must be triggered on the first row
-    last_row_pos_blk[l] = row_pos_blk[l]-1;
-  }
-
-  tft.startWrite();
-  uint16_t *rowDest = &lineBuffer[BUFFER_SIZE * buffer_flip];
-
-  for (int screenY = interleave; screenY < SCREEN_HEIGHT; screenY += (1+interlace)) {
-    memset(rowDest, 0, BUFFER_SIZE*2);
-
-    // Stage 1, iterate each layer for caching tile IDs
-    for (unsigned int l = 0; l < 4; l++){
-      if( !layers[l].visible ){ continue; }
-      uint8_t *rowTiles = (uint8_t*)(&tileChunksRowOriginal[l][0]);
-      uint8_t *rowTilesCopy = (uint8_t*)(&tileChunksRow[l][0]);
-      if (row_pos_blk[l] != last_row_pos_blk[l]){
-        last_row_pos_blk[l] = row_pos_blk[l];
-        const struct tilemap *map = layers[l].mapData;
-        unsigned int tileIdx = row_pos_blk[l] * map->width;
-        unsigned int tileCol = col_pos_blk[l];
-        // Pre-load them for this entire row into SRAM from PROGMEM
-        for (unsigned int col = 0; col < TILES_SCREEN_WIDTH; col++) {
-            rowTiles[col] = pgm_read_byte(&map->tilemap[tileIdx + tileCol]);
-            tileCol = ( tileCol + 1 ) % map->width;
-        }
-      }
-      // Copy to the second cache for constant modify, preserving original
-      for (unsigned int col = 0; col < TILES_SCREEN_WIDTH; col++) {
-          rowTilesCopy[col] = rowTiles[col];
-      }
-    }
-
-    // Stage 2, iterate each layer for heurestical rendering
-    for (int l = 3; l >= 0; l--){
-      if( !layers[l].visible ){ continue; }
-      const struct tilemap *map = layers[l].mapData;
-      const uint16_t *tsColors = map->tileset->colors;
-      unsigned int startBufferX = 16 - col_pos_off[l];
-      uint16_t *bufferX = &rowDest[startBufferX];
-      uint8_t *fullRowCache = (uint8_t*)&tileChunksRow[l][0];
-
-      // Hold opaque pixel bits of currently rendered tile
-      // and store it into the array for whole screen tiles row
-      unsigned int opaqueTilesInRow[TILES_SCREEN_WIDTH]= { 0 };
-
-      // Loop through 4 chunks of 4-tiles-at-once
-      for(unsigned int i = 0; i < (TILES_SCREEN_WIDTH+3)/4; i++){
-        uint32_t*tilesChunk = (uint32_t*)&tileChunksRow[l][i];
-
-        // check for 64 pixels (or 4 tiles) skip
-        if(!*tilesChunk){ bufferX += 64; continue; }
-        uint8_t *rowCache = (uint8_t*)tilesChunk;
-
-        // We are inside a chunk of 4-tiles-at-once
-        // Let's loop through 4 tiles
-        for(unsigned int j = 0; j < 4; j++ ){
-          unsigned int tileID = rowCache[j];
-          unsigned int opaquePixelsInTile = 0;
-
-          // check for 16 pixels (or 1 tile) skip
-          if(!tileID){ bufferX += 16; continue; }
-          // do batching for identical tileIDs
-          unsigned int batchLen = 0;
-          for(unsigned int n = i*4+j, p = 0; n < TILES_SCREEN_WIDTH; n++, p += 16){
-            if(tileID == fullRowCache[n]){
-              tileBatches[batchLen++] = p;
-              fullRowCache[n] = 0;
-            }
-          }
-          unsigned int tileX = (tileID % 16)*16; // dword aligned
-          unsigned int tileY = (tileID / 16)*16 + row_pos_off[l];
-          unsigned int tileCoord = tileY*256 + tileX;
-          const uint32_t *tsDwords = (uint32_t*)&map->tileset->pixels[tileCoord];
-
-          // We are inside a tile, and it has 16 pixels width,
-          // Lets loop through 4 chunks of 4-pixels-at-once
-          for(unsigned int k = 0; k < 4; k++){
-            unsigned int pixelsChunk = pgm_read_dword(&tsDwords[k]);
-            // check for 4 pixels skip
-            if(!pixelsChunk){ bufferX += 4; continue; }
-            uint8_t *tsPixels = (uint8_t*)&pixelsChunk;
-            for(unsigned int m = 0; m < 4; m++){
-              unsigned int pixel = tsPixels[m];
-              opaquePixelsInTile <<= 1;
-              // check for 1 pixel skip
-              if(!pixel){ bufferX++; continue; }
-              opaquePixelsInTile |= 1;
-              unsigned int color = pgm_read_word(&tsColors[pixel]);
-              for(unsigned o = 0; o < batchLen; o++){
-                if(!bufferX[tileBatches[o]])
-                  bufferX[tileBatches[o]] = (color >> 8) | (color << 8);
-              }
-              bufferX++;
-            }
-          }
-          // 
-          for(unsigned k = 0; k < batchLen; k++){
-            opaqueTilesInRow[i*4+j+(tileBatches[k]>>4)] = opaquePixelsInTile;
-          }
-        }
-      }
-
-      // if occlusion enabled, prune the below layers
-      for(unsigned int i = 1; i < TILES_SCREEN_WIDTH; i++){
-        if( opaqueTilesInRow[i] == 0b1111111111111111 ){
-          if( opaqueTilesInRow[i-1] == 0b1111111111111111 ){
-            for ( unsigned int z = 0; z < l ; z++){
-              int o = (int)col_pos_off[z]-(int)col_pos_off[l];
-              ((uint8_t*)&tileChunksRow[z][0])[i-(o<0)] = 0;
-            }
-          }
-        }
-      }
-
-      row_pos_off[l] += (1+interlace);
-      if(row_pos_off[l] >= 16){
-        row_pos_off[l] -= 16;
-        row_pos_blk[l] += 1;
-        if (row_pos_blk[l] >= map->height){
-          row_pos_blk[l] -= map->height;
-        }
-      }
-    }
-    tft.setAddrWindow(0, screenY, SCREEN_WIDTH, 1);
-    tft.pushPixels(&rowDest[16], SCREEN_WIDTH* 1);
-  }
-  
-  tft.endWrite();
-  interleave ^= interlace;
+void initDMA(){
+  #if defined(ESP32)
+    tft.initDMA();
+  #endif
 }
 
 void renderLayers_debug() {
@@ -245,6 +98,8 @@ void renderLayers_debug() {
   unsigned int tileChunksRow[4][(TILES_SCREEN_WIDTH+3)/4];
   // For Dynamic Batching
   unsigned int tileBatches[TILES_SCREEN_WIDTH];
+  // For uh, transparent tile mark flag thing
+  unsigned int tileBools[4]; // stores whole row information
 
   // Iterate each layer to get their states, calculated only once
   for (unsigned int l = 0; l < 4; l++){
@@ -262,9 +117,9 @@ void renderLayers_debug() {
   }
 
   tft.startWrite();
-  uint16_t *rowDest = &lineBuffer[BUFFER_SIZE * buffer_flip];
 
   for (int screenY = interleave; screenY < SCREEN_HEIGHT; screenY += (1+interlace)) {
+    uint16_t *rowDest = &lineBuffer[BUFFER_SIZE * buffer_flip];
     memset(rowDest, 0, BUFFER_SIZE*2);
 
     // Stage 1, iterate each layer for caching tile IDs
@@ -287,6 +142,12 @@ void renderLayers_debug() {
       for (unsigned int col = 0; col < TILES_SCREEN_WIDTH; col++) {
           rowTilesCopy[col] = rowTiles[col];
       }
+      // Fill the padding with 0
+      for (unsigned int col = TILES_SCREEN_WIDTH; col < sizeof(tileChunksRow[l]); col++){
+          rowTilesCopy[col] = 0;
+      }
+      // Mark the flag all opaque of all rowTiles first
+      tileBools[l] = (l==3);
     }
 
     // Stage 2, iterate each layer for heurestical rendering
@@ -322,6 +183,10 @@ void renderLayers_debug() {
         // We are inside a chunk of 4-tiles-at-once
         // Let's loop through 4 tiles
         for(unsigned int j = 0; j < 4; j++ ){
+          unsigned int tileRowIdx = i*4+j;
+          // PIPELINE PROTECTION: Stop evaluating tiles that don't exist
+          if (tileRowIdx >= TILES_SCREEN_WIDTH) { break; }
+
           unsigned int tileID = rowCache[j];
           unsigned int opaquePixelsInTile = 0;
 
@@ -335,15 +200,17 @@ void renderLayers_debug() {
                 0b0000010000000000 * (l == 3) ; // Layer 3 no skip 16 pixels
             }
           }
+          
           // do batching for identical tileIDs
           unsigned int batchLen = 0;
-          for(unsigned int n = i*4+j, p = 0; n < TILES_SCREEN_WIDTH; n++, p += 16){
+          for(unsigned int n = tileRowIdx; n < TILES_SCREEN_WIDTH; n++){
             if(tileID == fullRowCache[n]){
-              tileBatches[batchLen++] = p;
+              tileBatches[batchLen++] = (n-tileRowIdx)*16;
               fullRowCache[n] = 0;
             }
             if (!enable_batching) break; // put only one in the batch, for debug purposes
           }
+          bool directWrite = (( batchLen == 1 ) && (tileBools[l] & (1UL << tileRowIdx)));
           unsigned int tileX = (tileID % 16)*16; // dword aligned
           unsigned int tileY = (tileID / 16)*16 + row_pos_off[l];
           unsigned int tileCoord = tileY*256 + tileX;
@@ -359,12 +226,11 @@ void renderLayers_debug() {
             if(debug_mode==2){
               for(int z = 0; z < 4; z++){
                 bufferX[z]  |= 
-                  0b0000000001000000 * (l == 1) | // Layer 0 no skip 4 pixels
-                  0b0000000000000010 * (l == 2) | // Layer 1 no skip 4 pixels
-                  0b0000100000000000 * (l == 3) ; // Layer 2 no skip 4 pixels
+                  0b0000000001000000 * (l == 1) | // Layer 1 no skip 4 pixels
+                  0b0000000000000010 * (l == 2) | // Layer 2 no skip 4 pixels
+                  0b0000100000000000 * (l == 3) ; // Layer 3 no skip 4 pixels
               }
             }
-
             uint8_t *tsPixels = (uint8_t*)&pixelsChunk;
             if(!debug_mode){
               if(!enable_occlusion){
@@ -373,13 +239,25 @@ void renderLayers_debug() {
                   // check for 1 pixel skip
                   if(!pixel){ bufferX++; continue; }
                   unsigned int color = pgm_read_word(&tsColors[pixel]);
-                  for(unsigned o = 0; o < batchLen; o++){
-                    bufferX[tileBatches[o]] = (color >> 8) | (color << 8);
-                  }
+                  color = ( ( color >> 8 ) | ( color << 8 ) );
+                  for(unsigned o = 0; o < batchLen; o++)
+                    bufferX[tileBatches[o]] = color;
                   bufferX++;
                 }
               }
-              else{
+              else if ( directWrite ) {
+                // guaranteed to be one only tile
+                for(unsigned int m = 0; m < 4; m++){
+                  unsigned int pixel = tsPixels[m];
+                  opaquePixelsInTile <<= 1;
+                  // check for 1 pixel skip
+                  if(!pixel){ bufferX++; continue; }
+                  opaquePixelsInTile |= 1;
+                  unsigned int color = pgm_read_word(&tsColors[pixel]);
+                  *bufferX++ = ( ( color >> 8 ) | ( color << 8 ) );
+                }
+              }else{
+                // render batches of tiles
                 for(unsigned int m = 0; m < 4; m++){
                   unsigned int pixel = tsPixels[m];
                   opaquePixelsInTile <<= 1;
@@ -388,10 +266,10 @@ void renderLayers_debug() {
                   opaquePixelsInTile |= 1;
 
                   unsigned int color = pgm_read_word(&tsColors[pixel]);
+                  color = ( ( color >> 8 ) | ( color << 8 ) );
                   for(unsigned o = 0; o < batchLen; o++){
-                    if(!bufferX[tileBatches[o]]){
-                      bufferX[tileBatches[o]] = (color >> 8) | (color << 8);
-                    }
+                    if(!bufferX[tileBatches[o]])
+                      bufferX[tileBatches[o]] = color;
                   }
                   bufferX++;
                 }
@@ -431,7 +309,19 @@ void renderLayers_debug() {
                       0b0000000000000100 * (l == 2) |  // Layer 2 clone batch color
                       0b0001000000000000 * (l == 3) ;  // Layer 3 clone batch color
                       break;
-                    case 4: ///////////////////////////// VISUALIZE DEPTH
+                    case 4: { /////////////////////////// VISUALIZE FAST VS SLOW DRAW
+                      bool z = directWrite | o         ;
+                      bufferX[tileBatches[o]] |= z  ?  // -------------------------
+                      0b1000001000010000 * (l == 0) |  // Layer 0 fast tile color
+                      0b0000000001001000 * (l == 1) |  // Layer 1 fast tile color
+                      0b0110000000000010 * (l == 2) |  // Layer 2 fast tile color
+                      0b0000100100000000 * (l == 3) :  // Layer 3 fast tile color
+                      0b0000010000100001 * (l == 0) |  // Layer 0 slow tile color
+                      0b0000000010000000 * (l == 1) |  // Layer 1 slow tile color
+                      0b0000000000000100 * (l == 2) |  // Layer 2 slow tile color
+                      0b0001000000000000 * (l == 3) ;  // Layer 3 slow tile color
+                      break; }
+                    case 5: ///////////////////////////// VISUALIZE DEPTH
                       if(!bufferX[tileBatches[o]]){
                       bufferX[tileBatches[o]]    = 0  |  // ---------------
                         0b0100010100101001 * (l == 0) |  // Layer 0 depth 1
@@ -440,7 +330,7 @@ void renderLayers_debug() {
                         0b0101010110101101 * (l == 3) ;  // Layer 3 depth 4
                       }
                       break;
-                    case 5: ///////////////////////////// GRAYSCALE MODE
+                    case 6: ///////////////////////////// GRAYSCALE MODE
                       if(!bufferX[tileBatches[o]]){
                         unsigned int color = pgm_read_word(&tsColors[pixel]);
                         unsigned int r_col = color >> 11           ; // 25.0% red
@@ -463,19 +353,43 @@ void renderLayers_debug() {
           }
           // 
           for(unsigned k = 0; k < batchLen; k++){
-            opaqueTilesInRow[i*4+j+(tileBatches[k]>>4)] = opaquePixelsInTile;
+            opaqueTilesInRow[tileRowIdx+(tileBatches[k]>>4)] = opaquePixelsInTile;
           }
         }
       }
 
-      // if occlusion enabled, prune the below layers
+      // if occlusion enabled, do tile optimization
       if(enable_occlusion){
+        // Optimize occluded tiles of below layers by pruning them
+        // because of above them being opaque
         for(unsigned int i = 1; i < TILES_SCREEN_WIDTH; i++){
           if( opaqueTilesInRow[i] == 0b1111111111111111 ){
             if( opaqueTilesInRow[i-1] == 0b1111111111111111 ){
               for ( unsigned int z = 0; z < l ; z++){
                 int o = (int)col_pos_off[z]-(int)col_pos_off[l];
                 ((uint8_t*)&tileChunksRow[z][0])[i-(o<0)] = 0;
+              }
+            }
+          }
+          // and if the tiles above them guaranteed to be
+          // fully transparent
+
+          // Cascading Transparent Z-Buffer Bypass
+          if(l > 0){
+            if( opaqueTilesInRow[i] == 0b0000000000000000 ){
+              if( opaqueTilesInRow[i-1] == 0b0000000000000000 ){
+                // ONLY pass the baton to the next layer if THIS layer is 
+                // the absolute front (l==3), OR if it received the baton from above.
+                // Parallax overlap: the tile in l-1 straddles BOTH i and i-1 in layer l.
+                // BOTH overlapping tiles in the current layer must possess the baton.
+                bool has_baton = ( l == 3 ) || ( ( ( tileBools[l] >> (i-1)) & 0b11 ) == 0b11 );
+                // Readable ver:
+                // bool has_baton = (l == 3) || ( (tileBools[l] & (1UL << i)) && (tileBools[l] & (1UL << (i-1))) );
+                
+                if (has_baton) {
+                  int o = (int)col_pos_off[l-1] - (int)col_pos_off[l];
+                  tileBools[l-1] |= 1UL << (i - (o < 0));
+                }
               }
             }
           }
@@ -491,8 +405,250 @@ void renderLayers_debug() {
         }
       }
     }
+    
     tft.setAddrWindow(0, screenY, SCREEN_WIDTH, 1);
-    tft.pushPixels(&rowDest[16], SCREEN_WIDTH* 1);
+
+    // 6. Fast SPI block flush
+    if(double_buffer){
+      #if defined (ESP32)
+      tft.pushPixelsDMA(&rowDest[16], SCREEN_WIDTH);
+      #else
+      tft.pushPixels(&rowDest[16], SCREEN_WIDTH);
+      #endif
+    }else{
+      tft.pushPixels(&rowDest[16], SCREEN_WIDTH);
+    }
+    // Toggle double buffer index for the next block
+    buffer_flip ^= double_buffer;
+  }
+  
+  tft.endWrite();
+  interleave ^= interlace;
+}
+
+
+void renderLayers(){
+  // Tile state caching for fast accesses
+  unsigned int row_pos_blk[4]; // - Current row tile block position
+  unsigned int row_pos_off[4]; // - Current row tile pixel offset
+  unsigned int col_pos_blk[4]; // - Column start tile block position
+  unsigned int col_pos_off[4]; // - Column start tile pixel offset
+
+  unsigned int last_row_pos_blk[4];
+
+  // Tile ID caching for rendering current row
+  // Aligned to DWORD size for fast heuristical comparison
+  unsigned int tileChunksRowOriginal[4][(TILES_SCREEN_WIDTH+3)/4];
+  // Copy of it because constantly modified during rendering
+  unsigned int tileChunksRow[4][(TILES_SCREEN_WIDTH+3)/4];
+  // For Dynamic Batching
+  unsigned int tileBatches[TILES_SCREEN_WIDTH];
+  // For uh, transparent tile mark flag thing
+  unsigned int tileBools[4]; // stores whole row information
+
+  // Iterate each layer to get their states, calculated only once
+  for (unsigned int l = 0; l < 4; l++){
+    const struct tilemap *map = layers[l].mapData;
+    // mapWorldPos = scrollPos % mapSize
+    unsigned int mapWorldY = ( layers[l].scrollY + interleave ) % (map->height * 16);
+    unsigned int mapWorldX = layers[l].scrollX % (map->width * 16);
+    // split tile block and pixel offset position
+    row_pos_blk[l] = mapWorldY / 16;
+    row_pos_off[l] = mapWorldY % 16;
+    col_pos_blk[l] = mapWorldX / 16;
+    col_pos_off[l] = mapWorldX % 16;
+    // tileID caching must be triggered on the first row
+    last_row_pos_blk[l] = row_pos_blk[l]-1;
+  }
+
+  tft.startWrite();
+
+  for (int screenY = interleave; screenY < SCREEN_HEIGHT; screenY += (1+interlace)) {
+    uint16_t *rowDest = &lineBuffer[BUFFER_SIZE * buffer_flip];
+    memset(rowDest, 0, BUFFER_SIZE*2);
+
+    // Stage 1, iterate each layer for caching tile IDs
+    for (unsigned int l = 0; l < 4; l++){
+      if( !layers[l].visible ){ continue; }
+      uint8_t *rowTiles = (uint8_t*)(&tileChunksRowOriginal[l][0]);
+      uint8_t *rowTilesCopy = (uint8_t*)(&tileChunksRow[l][0]);
+      if (row_pos_blk[l] != last_row_pos_blk[l]){
+        last_row_pos_blk[l] = row_pos_blk[l];
+        const struct tilemap *map = layers[l].mapData;
+        unsigned int tileIdx = row_pos_blk[l] * map->width;
+        unsigned int tileCol = col_pos_blk[l];
+        // Pre-load them for this entire row into SRAM from PROGMEM
+        for (unsigned int col = 0; col < TILES_SCREEN_WIDTH; col++) {
+            rowTiles[col] = pgm_read_byte(&map->tilemap[tileIdx + tileCol]);
+            tileCol = ( tileCol + 1 ) % map->width;
+        }
+      }
+      // Copy to the second cache for constant modify, preserving original
+      for (unsigned int col = 0; col < TILES_SCREEN_WIDTH; col++) {
+          rowTilesCopy[col] = rowTiles[col];
+      }
+      // Fill the padding with 0
+      for (unsigned int col = TILES_SCREEN_WIDTH; col < sizeof(tileChunksRow[l]); col++){
+          rowTilesCopy[col] = 0;
+      }
+      // Mark the flag all opaque of all rowTiles first
+      tileBools[l] = (l==3);
+    }
+
+    // Stage 2, iterate each layer for heurestical rendering
+    for (unsigned int L = 0; L < 4; L++){
+      unsigned int l = 3-L;
+      if( !layers[l].visible ){ continue; }
+      const struct tilemap *map = layers[l].mapData;
+      const uint16_t *tsColors = map->tileset->colors;
+      unsigned int startBufferX = 16 - col_pos_off[l];
+      uint16_t *bufferX = &rowDest[startBufferX];
+      uint8_t *fullRowCache = (uint8_t*)&tileChunksRow[l][0];
+
+      // Hold opaque pixel bits of currently rendered tile
+      // and store it into the array for whole screen tiles row
+      unsigned int opaqueTilesInRow[TILES_SCREEN_WIDTH]= { 0 };
+
+      // Loop through 4 chunks of 4-tiles-at-once
+      for(unsigned int i = 0; i < (TILES_SCREEN_WIDTH+3)/4; i++){
+        uint32_t*tilesChunk = (uint32_t*)&tileChunksRow[l][i];
+
+        // check for 64 pixels (or 4 tiles) skip
+        if(!*tilesChunk){ bufferX += 64; continue; }
+        uint8_t *rowCache = (uint8_t*)tilesChunk;
+
+        // We are inside a chunk of 4-tiles-at-once
+        // Let's loop through 4 tiles
+        for(unsigned int j = 0; j < 4; j++ ){
+          unsigned int tileRowIdx = i*4+j;
+          // PIPELINE PROTECTION: Stop evaluating tiles that don't exist
+          if (tileRowIdx >= TILES_SCREEN_WIDTH) { break; }
+
+          unsigned int tileID = rowCache[j];
+          unsigned int opaquePixelsInTile = 0;
+
+          // check for 16 pixels (or 1 tile) skip
+          if(!tileID){ bufferX += 16; continue; }
+          
+          // do batching for identical tileIDs
+          unsigned int batchLen = 0;
+          for(unsigned int n = tileRowIdx; n < TILES_SCREEN_WIDTH; n++){
+            if(tileID == fullRowCache[n]){
+              tileBatches[batchLen++] = (n-tileRowIdx)*16;
+              fullRowCache[n] = 0;
+            }
+          }
+          bool directWrite = (( batchLen == 1 ) && (tileBools[l] & (1UL << tileRowIdx)));
+          unsigned int tileX = (tileID % 16)*16; // dword aligned
+          unsigned int tileY = (tileID / 16)*16 + row_pos_off[l];
+          unsigned int tileCoord = tileY*256 + tileX;
+          const uint32_t *tsDwords = (uint32_t*)&map->tileset->pixels[tileCoord];
+
+          // We are inside a tile, and it has 16 pixels width,
+          // Lets loop through 4 chunks of 4-pixels-at-once
+          for(unsigned int k = 0; k < 4; k++){
+
+            unsigned int pixelsChunk = pgm_read_dword(&tsDwords[k]);
+            // check for 4 pixels skip
+            if(!pixelsChunk){ bufferX += 4; continue; }
+            uint8_t *tsPixels = (uint8_t*)&pixelsChunk;
+            if ( directWrite ) {
+              // guaranteed to be one only tile
+              for(unsigned int m = 0; m < 4; m++){
+                unsigned int pixel = tsPixels[m];
+                opaquePixelsInTile <<= 1;
+                // check for 1 pixel skip
+                if(!pixel){ bufferX++; continue; }
+                opaquePixelsInTile |= 1;
+                unsigned int color = pgm_read_word(&tsColors[pixel]);
+                *bufferX++ = ( ( color >> 8 ) | ( color << 8 ) );
+              }
+            }else{
+              // render batches of tiles
+              for(unsigned int m = 0; m < 4; m++){
+                unsigned int pixel = tsPixels[m];
+                opaquePixelsInTile <<= 1;
+                // check for 1 pixel skip
+                if(!pixel){ bufferX++; continue; }
+                opaquePixelsInTile |= 1;
+
+                unsigned int color = pgm_read_word(&tsColors[pixel]);
+                color = ( ( color >> 8 ) | ( color << 8 ) );
+                for(unsigned o = 0; o < batchLen; o++){
+                  if(!bufferX[tileBatches[o]])
+                    bufferX[tileBatches[o]] = color;
+                }
+                bufferX++;
+              }
+            }
+          }
+          // 
+          for(unsigned k = 0; k < batchLen; k++){
+            opaqueTilesInRow[tileRowIdx+(tileBatches[k]>>4)] = opaquePixelsInTile;
+          }
+        }
+      }
+
+      // if occlusion enabled, do tile optimization
+      // Optimize occluded tiles of below layers by pruning them
+      // because of above them being opaque
+      for(unsigned int i = 1; i < TILES_SCREEN_WIDTH; i++){
+        if( opaqueTilesInRow[i] == 0b1111111111111111 ){
+          if( opaqueTilesInRow[i-1] == 0b1111111111111111 ){
+            for ( unsigned int z = 0; z < l ; z++){
+              int o = (int)col_pos_off[z]-(int)col_pos_off[l];
+              ((uint8_t*)&tileChunksRow[z][0])[i-(o<0)] = 0;
+            }
+          }
+        }
+        // and if the tiles above them guaranteed to be
+        // fully transparent
+
+        // Cascading Transparent Z-Buffer Bypass
+        if(l > 0){
+          if( opaqueTilesInRow[i] == 0b0000000000000000 ){
+            if( opaqueTilesInRow[i-1] == 0b0000000000000000 ){
+              // ONLY pass the baton to the next layer if THIS layer is 
+              // the absolute front (l==3), OR if it received the baton from above.
+              // Parallax overlap: the tile in l-1 straddles BOTH i and i-1 in layer l.
+              // BOTH overlapping tiles in the current layer must possess the baton.
+              bool has_baton = ( l == 3 ) || ( ( ( tileBools[l] >> (i-1)) & 0b11 ) == 0b11 );
+              // Readable ver:
+              // bool has_baton = (l == 3) || ( (tileBools[l] & (1UL << i)) && (tileBools[l] & (1UL << (i-1))) );
+              
+              if (has_baton) {
+                int o = (int)col_pos_off[l-1] - (int)col_pos_off[l];
+                tileBools[l-1] |= 1UL << (i - (o < 0));
+              }
+            }
+          }
+        }
+      }
+
+      row_pos_off[l] += (1+interlace);
+      if(row_pos_off[l] >= 16){
+        row_pos_off[l] -= 16;
+        row_pos_blk[l] += 1;
+        if (row_pos_blk[l] >= map->height){
+          row_pos_blk[l] -= map->height;
+        }
+      }
+    }
+    
+    tft.setAddrWindow(0, screenY, SCREEN_WIDTH, 1);
+
+    // 6. Fast SPI block flush
+    if(double_buffer){
+      #if defined (ESP32)
+      tft.pushPixelsDMA(&rowDest[16], SCREEN_WIDTH);
+      #else
+      tft.pushPixels(&rowDest[16], SCREEN_WIDTH);
+      #endif
+    }else{
+      tft.pushPixels(&rowDest[16], SCREEN_WIDTH);
+    }
+    // Toggle double buffer index for the next block
+    buffer_flip ^= double_buffer;
   }
   
   tft.endWrite();
@@ -508,12 +664,9 @@ void setup() {
   Serial.begin(115200);
   pinMode(0, OUTPUT); // For CPU profiling
   tft.init();
+  initDMA();
 
-  #if defined (ESP32)
-    tft.initDMA(true);
-  #endif
-
-  tft.setRotation(1); // Adjust orientation as needed (0 to 3)
+  tft.setRotation(ORIENTATION); // Adjust orientation as needed (0 to 3)
   tft.fillScreen(TFT_BLACK);
   delay(1000);
 
@@ -573,14 +726,24 @@ void loop() {
       case 0: // debug mode selector
         if (payload > 0){
           debug_enable = true;
-          debug_mode = ( payload < 7 ? payload : 1 ) - 1;
-          Serial.print("debug mode is adjusted to: ");
-          if (debug_mode == 0) Serial.println("visualize normal");
-          if (debug_mode == 1) Serial.println("visualize overdraw");
-          if (debug_mode == 2) Serial.println("visualize skipping pixels");
-          if (debug_mode == 3) Serial.println("visualize unique vs clone tile render");
-          if (debug_mode == 4) Serial.println("visualize depthmap");
-          if (debug_mode == 5) Serial.println("gray scale mode");
+          const char *debug_menus[7] = {
+            "visualize normal",
+            "visualize overdraw",
+            "visualize skipping pixels",
+            "visualize unique vs clone tile render",
+            "visualize fastpath",
+            "visualize depthmap",
+            "gray scale mode",
+          };
+
+          
+          const uint32_t debugMenuCount = sizeof(debug_menus) / sizeof(debug_menus[0]);
+
+          if (payload >= 1 && payload <= debugMenuCount) {
+            debug_enable = true;
+            debug_mode = payload - 1;
+            Serial.printf("debug mode is adjusted to: %s\n", debug_menus[debug_mode]);
+          } else if (payload != 0) Serial.println("invalid debug mode");
         }else{
           debug_enable = false;
           Serial.println("debug is disabled");
@@ -590,12 +753,16 @@ void loop() {
         command = payload / 100;
         payload = payload % 100;
         if(command<3){
-          switch(command){
-            case 0 : layers[payload].visible = !layers[payload].visible; break; // toggle
-            case 1 : layers[payload].visible = false; break; // set layer hidden
-            case 2 : layers[payload].visible = true; break; // set layer visible
+          if (payload < 4) {
+            switch(command){
+              case 0 : layers[payload].visible = !layers[payload].visible; break; // toggle
+              case 1 : layers[payload].visible = false; break; // set layer hidden
+              case 2 : layers[payload].visible = true; break; // set layer visible
+            }
+            Serial.printf("layer %d is %s\n",payload,layers[payload].visible?"visible":"hidden");
+          }else{
+            Serial.println("invalid layer index");
           }
-          Serial.printf("layer %d is %s\n",payload,layers[payload].visible?"visible":"hidden");
         }else
         {
           if(payload < 4){
@@ -615,15 +782,19 @@ void loop() {
         char*name_options[3] = { "skipping", "batching", "occlussion" };
 
         if(command<3){
-          switch(command){
-            case 0 : bool_options[payload] = !bool_options[payload]; //toggle
-            case 1 : bool_options[payload] = false; // disable option
-            case 2 : bool_options[payload] = true; // enable option
+          if( payload < 3 ){
+            switch(command){
+              case 0 : bool_options[payload] = !bool_options[payload]; break; //toggle
+              case 1 : bool_options[payload] = false;  break; // disable option
+              case 2 : bool_options[payload] = true;  break; // enable option
+            }
+            enable_skipping  = bool_options[0];
+            enable_batching  = bool_options[1];
+            enable_occlusion = bool_options[2];
+            Serial.printf("enable_%s is %s\n", name_options[payload], bool_options[payload] ? "enabled":"disabled");
+          }else{
+            Serial.println("invalid tile optimization option");
           }
-          enable_skipping  = bool_options[0];
-          enable_batching  = bool_options[1];
-          enable_occlusion = bool_options[2];
-          Serial.printf("enable_%s is %s\n", name_options[payload], bool_options[payload] ? "enabled":"disabled");
         }else
         {
           if(payload < 3){
@@ -640,15 +811,21 @@ void loop() {
         payload = payload % 100;
 
         bool bool_options[3] = { interlace, double_buffer };
-        char*name_options[3] = { "interlace", "double_buffer" };
+        const char*name_options[3] = { "interlace", "double_buffer" };
 
-        if(command<3){
-          switch(command){
-            case 0 : bool_options[payload] = !bool_options[payload]; //toggle
-            case 1 : bool_options[payload] = false; // disable option
-            case 2 : bool_options[payload] = true; // enable option
+        if( command < 3 ){
+          if( payload < 2 ){
+            switch(command){
+              case 0 : bool_options[payload] = !bool_options[payload]; break; //toggle
+              case 1 : bool_options[payload] = false; break; // disable option
+              case 2 : bool_options[payload] = true; break; // enable option
+            }
+            interlace = bool_options[0];
+            double_buffer = bool_options[1];
+            Serial.printf("%s is %s\n", name_options[payload], bool_options[payload] ? "enabled":"disabled");
+          }else{
+            Serial.println("invalid screen rendering option");
           }
-          Serial.printf("%s is %s\n", name_options[payload], bool_options[payload] ? "enabled":"disabled");
         }else
         {
           if(payload < 2){
