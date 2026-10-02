@@ -1,137 +1,142 @@
-# ESP8266 Multi-Layer Parallax Engine
+# Multi-Layer Parallax Tile Renderer
 
-A high-performance, tile-based 2D rendering engine built for ESP8266, and can also be compiled for ESP32 or RP2040. It achieves a stable 25–35 FPS (ESP8266 @160MHz) while pushing four simultaneous layers of parallax tiles across a TFT display.
+A high-performance, tile-based 2D rendering engine for ESP32 and ESP8266 TFT projects. The renderer is optimized around a single-core pipeline that keeps the hot path compact, uses row caching from flash/PROGMEM, and aggressively avoids wasted work.
+
+This project focuses on a fast tile renderer for layered parallax scenes and is tuned for low-memory microcontrollers. It is designed around a direct-write fast path, batched tile rendering, transparent-pixel skipping, and per-row occlusion pruning.
 
 https://github.com/user-attachments/assets/c29ea7c5-c16b-4343-80fd-1d8297859b68
 
-The engine is heavily optimized for low-resource microcontrollers, utilizing aggressive spatial caching, bit-shifting math, and run-time occlusion culling to minimize SPI bandwidth and CPU overhead.
+## What this project does
 
-## Core Features
+- Renders a 4-layer scrolling parallax scene
+- Keeps each layer independently scrollable in X/Y
+- Uses dynamic tile batching to reduce redundant work
+- Skips transparent or zero-value chunks early
+- Uses a fast direct-write path for single opaque tiles
+- Prunes lower layers when upper layers fully cover the row
+- Supports interlaced display updates and optional double buffering
+- Includes runtime debug overlays for optimization analysis
 
-* **4-Layer Parallax Scrolling:** Independent X/Y camera offsets for background, midground, and dual foreground layers.
-* **Dynamic Occlusion Culling:** Builds a 16-bit vertical opacity map on the fly. When foreground layers completely obscure background tiles, the background rendering is pruned at the row-cache level.
-* **Tile Skipping & Dynamic Batching:**
-  * Evaluates 64-pixel (4-tile) and 16-pixel (1-tile) chunks, instantly skipping transparent regions.
-  * Batches identical background tiles across the same row to push contiguous color data to the display in single bursts.
-* **Fixed-Point Math Optimizations:** Grayscale visual modes use pure bit-shifting and integer multiplication (~25% R, 50% G, 12.5% B) to bypass the ESP8266's slow floating-point unit.
-* **Interlacing & Double Buffering:** Splits rendering workloads across alternating scanlines to maintain high framerates and prevent screen tearing.
+## Core optimizations
 
-## Debug Visualization Suite
+### Fast path / direct write
 
-The engine includes a built-in hardware profiler and visualizer controlled via Serial input, allowing real-time analysis of the rendering pipeline.
+The rendering engine detects cases where a tile is unique, opaque, and fully safe to write directly without checking whether a pixel is already filled. That avoids the cost of the slower read-check-write path.
 
-### Runtime Debug Selection
+### Dynamic batching
 
-Send a single integer value over Serial at 115200 baud:
+Adjacent identical tiles are grouped and rendered together. This reduces repeated fetch and color conversion work in dense regions.
 
-* **0**: Disable debug mode and return to the normal production renderer
-* **1**: Standard diagnostic rendering
-* **2**: Overdraw Heatmap (visualizes wasted pixels drawn behind other layers)
-* **3**: Skipped Pixels (highlights chunks effectively bypassed by the engine)
-* **4**: Unique vs. Clone Tile Render (highlights dynamically batched tiles)
-* **5**: Z-Depth Map
-* **6**: Hardware-Accelerated Grayscale
+### Transparent pixel skipping
 
-### Important Note About Runtime Optimization Controls
+The code evaluates 64-pixel (4-tile), 16-pixel (1-tile), and 4-pixel tile chunks. Empty chunks are skipped immediately, saving a lot of wasted CPU time.
 
-The engine has two render paths:
+### Occlusion pruning
 
-* **`renderLayers()`**: the production renderer used for normal operation. It is the fixed high-performance path.
-* **`renderLayers_debug()`**: the diagnostic renderer used when debug mode is enabled. This path supports runtime experimentation and visualization.
+When upper layers are fully opaque, lower layers are pruned for that region to avoid drawing behind already-occupied pixels. This reduces redundant overdraw and helps the engine stay fast.
 
-The optimization controls (`skipping`, `batching`, and `occlusion`) are intended for comparison and profiling inside the debug renderer. They are not meant to dynamically reconfigure the production render path at runtime.
+### PROGMEM-friendly data flow
 
-## Requirements
+Tile indices and tile data are cached from flash/PROGMEM into row-local SRAM buffers before rendering, keeping the hot path small and the memory footprint predictable.
 
-* **Hardware:** ESP8266 (e.g., Wemos D1 Mini / NodeMCU) and an SPI TFT Display (ILI9341 or similar).
-* **Software:** Arduino IDE, `TFT_eSPI` library.
-* **Compiler:** Uses `#pragma GCC optimize ("O3")` for maximum inline expansion.
+### DMA-friendly TFT output
 
-## Serial Command Interface
+The renderer fills a line buffer and pushes it to the TFT using TFT_eSPI with DMA when available on ESP32.
 
-The engine listens for 4-digit integer commands over the 115200 baud Serial monitor. The format is `C P P P`, where `C` is the command group (0-8) and `PPP` is the payload.
+## Runtime debug suite
 
-### Examples:
+The engine includes a built-in visual profiler and rendering debugger, controllable over Serial at 115200 baud.
 
-* `0001` - Switch to the diagnostic render mode for overdraw visualization.
-* `0000` - Disable debug mode and return to normal rendering.
-* `1201` - Set Layer 1 to visible.
-* `2201` - Enable dynamic tile batching.
-* `3101` - Enable interlaced rendering.
-* `4060` - Set target framerate to 60 FPS.
-* `8101` - Move camera right by 1 step.
+### Debug modes
 
-### Command Reference:
+Send a single integer value over Serial:
 
-* **000Y**: Debug Visualizers (0 = Disable debug mode, 1 = Diagnostic, 2 = Overdraw, 3 = Skip, 4 = Batching, 5 = Depth, 6 = Grayscale).
-* **1X0Y**: Layer Visibility (X is 0=Toggle, 1=Hide, 2=Show. Y is target Layer 0-3).
-* **2X0Y**: Engine Optimizations (X is 0=Toggle, 1=Enable, 2=Disable. Y is 0=Reset, 1=Skipping, 2=Batching, 3=Occlusion).
-* **3X0Y**: Display Configuration (X is 0=Toggle, 1=Enable, 2=Disable. Y is 0=Reset, 1=Interlace, 2=Double Buffer).
-* **4XXX**: Target Framerate (e.g., `4030` for 30 FPS).
-* **5XXX**: Camera Auto-Scroll Speed.
-* **6XXX / 7XXX**: Absolute Camera X / Y Position.
-* **8XXX**: Manual Camera Nudge (0=Left, 1=Right, 2=Up, 3=Down, 4=Toggle Auto-Scroll).
+- 0: Disable debug mode and render normally
+- 1: Overdraw heatmap
+- 2: Skip visualization
+- 3: Unique vs clone tile render
+- 4: Fast-path vs slow-path visualization
+- 5: Depth visualization
+- 6: Grayscale mode
 
-## Layer Visibility Options (1XXX)
+### Runtime optimization toggles
 
-| Command | Action | Target | Description |
-| --- | --- | --- | --- |
-| **1000** | Toggle | Layer 0 | Reverses visibility state of Layer 1 (Sky) |
-| **1001** | Toggle | Layer 1 | Reverses visibility state of Layer 2 (Forests) |
-| **1002** | Toggle | Layer 2 | Reverses visibility state of Layer 3 (Grounds) |
-| **1003** | Toggle | Layer 3 | Reverses visibility state of Layer 4 (Props) |
-| **1100** | Disable | Layer 0 | Forces Layer 1 to be hidden |
-| **1101** | Disable | Layer 1 | Forces Layer 2 to be hidden |
-| **1102** | Disable | Layer 2 | Forces Layer 3 to be hidden |
-| **1103** | Disable | Layer 3 | Forces Layer 4 to be hidden |
-| **1200** | Enable | Layer 0 | Forces Layer 1 to be visible |
-| **1201** | Enable | Layer 1 | Forces Layer 2 to be visible |
-| **1202** | Enable | Layer 2 | Forces Layer 3 to be visible |
-| **1203** | Enable | Layer 3 | Forces Layer 4 to be visible |
-| **1300** | Enable All | All Layers | Forces all 4 layers to be visible simultaneously |
+The engine exposes runtime controls for:
 
-## Tile Engine Optimizations (2XXX)
+- layer visibility
+- skipping
+- batching
+- occlusion
+- interlace
+- double buffering
+- target framerate
+- camera speed and position
 
-| Command | Action | Target | Description |
-| --- | --- | --- | --- |
-| **2000** | Toggle | Skipping | Reverses the state of 64px/16px transparent pixel skipping |
-| **2001** | Toggle | Batching | Reverses the state of dynamic tile batching |
-| **2002** | Toggle | Occlusion | Reverses the state of row occlusion culling |
-| **2100** | Disable | Skipping | Turns off pixel and chunk skipping |
-| **2101** | Disable | Batching | Turns off dynamic tile batching |
-| **2102** | Disable | Occlusion | Turns off row occlusion culling |
-| **2200** | Enable | Skipping | Turns on pixel and chunk skipping |
-| **2201** | Enable | Batching | Turns on dynamic tile batching |
-| **2202** | Enable | Occlusion | Turns on row occlusion culling |
-| **2300** | Enable All | All Ops | Enables skipping, batching, and occlusion simultaneously |
+## Project layout
 
-## Screen Rendering Options (3XXX)
+- `multi_layer_scroller.ino` – main render loop and engine logic
+- `frame_001_tilemap.h` through `frame_004_tilemap.h` – generated tilemaps for each parallax layer
 
-| Command | Action | Target | Description |
-| --- | --- | --- | --- |
-| **3000** | Toggle | Interlace | Reverses the state of interlaced rendering |
-| **3001** | Toggle | Double Buffer | Reverses the state of the DMA double buffer |
-| **3100** | Disable | Interlace | Turns off interlaced rendering |
-| **3101** | Disable | Double Buffer | Turns off the DMA double buffer |
-| **3200** | Enable | Interlace | Turns on interlaced rendering |
-| **3201** | Enable | Double Buffer | Turns on the DMA double buffer |
-| **3300** | Enable All | All Display | Enables both interlace and double buffering simultaneously |
+## Firmware requirements
 
-## Setup & Installation
+- ESP32 or ESP8266
+- SPI TFT display (ILI9341 or similar)
+- Arduino IDE
+- `TFT_eSPI` library configured for your display and board
 
-1. Install the `TFT_eSPI` library in the Arduino IDE and configure your `User_Setup.h` file to match your specific display driver and ESP8266 pinout.
-2. Ensure the generated tilemap header files (`frame_001_tilemap.h`, etc.) are placed in the same directory as the `.ino` file.
-3. Compile and flash to the ESP8266.
+## Serial command interface
 
+The engine listens for integer commands over Serial. Commands use the format `C P P P`, where `C` is the command group and `PPP` is the payload.
 
-# TFT_multi_layer_scroller
+Examples:
 
-Multi Layer Scrolling Parallax of Sunny Land
+- `0000` – disable debug mode
+- `0001` – enable overdraw visualization
+- `1201` – show layer 1
+- `2201` – enable batching
+- `3101` – enable interlace
+- `4060` – set framerate to 60 FPS
+- `8101` – nudge camera right
 
-## Author
-Kouzerumatsukite / Kouzeru / Bananafox / Bitwisefox 
+### Command reference
 
-## Assets used in this project:
+- `0XXX` – debug visualizers
+- `1X0Y` – layer visibility
+  - X: 0 = toggle, 1 = hide, 2 = show
+  - Y: target layer 0–3
+- `2X0Y` – engine optimization toggles
+  - X: 0 = toggle, 1 = enable, 2 = disable
+  - Y: skipping / batching / occlusion
+- `3X0Y` – display settings
+  - X: 0 = toggle, 1 = enable, 2 = disable
+  - Y: interlace / double buffer
+- `4XXX` – target framerate
+- `5XXX` – camera speed
+- `6XXX` – camera X position
+- `7XXX` – camera Y position
+- `8XXX` – manual camera adjustment / auto-scroll toggle
+
+## Typical performance
+
+This project is tuned for the ESP32 in particular, where the TFT DMA path and better CPU throughput make the renderer comfortably fast. On ESP8266, the same pipeline still runs reasonably well with lower graphics cost, especially when interlace and skipping are enabled.
+
+Expected performance depends on:
+
+- screen resolution
+- layer count
+- tile density / fill rate
+- toggles like interlace, batching, skipping, and occlusion
+- whether debug visualizations are active
+
+## Notes
+
+This repo is intentionally focused on the render pipeline itself. The goal is to maximize performance per pixel and keep the hot path as small and predictable as possible before adding more game systems or sprite logic.
+
+## Asset attribution
 
 Sunny Land - Pixel Game Art Assets Pack by ansimuz
 https://ansimuz.itch.io/sunny-land-pixel-game-art
+
+## Author
+
+Kouzerumatsukite / Kouzeru / Bananafox / Bitwisefox
