@@ -66,6 +66,8 @@ LayerControl layers[4] = {
   { &level_map_data_frame_004, 0, 0, true}, // Layer 4
 };
 
+static uint16_t sramPalettes[4][256];
+
 uint8_t interleave = 0;
 uint8_t buffer_flip = 0;
 
@@ -242,8 +244,7 @@ void renderLayers_debug(int debug_mode) {
                   unsigned int pixel = tsPixels[m];
                   // check for 1 pixel skip
                   if(!pixel){ bufferX++; continue; }
-                  unsigned int color = pgm_read_word(&tsColors[pixel]);
-                  color = ( ( color >> 8 ) | ( color << 8 ) );
+                  unsigned int color = sramPalettes[l][pixel];
                   for(unsigned o = 0; o < batchLen; o++)
                     bufferX[tileBatches[o]] = color;
                   bufferX++;
@@ -257,8 +258,7 @@ void renderLayers_debug(int debug_mode) {
                   // check for 1 pixel skip
                   if(!pixel){ bufferX++; continue; }
                   opaquePixelsInTile |= 1;
-                  unsigned int color = pgm_read_word(&tsColors[pixel]);
-                  *bufferX++ = ( ( color >> 8 ) | ( color << 8 ) );
+                  *bufferX++ = sramPalettes[l][pixel];
                 }
               }else{
                 // render batches of tiles
@@ -268,9 +268,7 @@ void renderLayers_debug(int debug_mode) {
                   // check for 1 pixel skip
                   if(!pixel){ bufferX++; continue; }
                   opaquePixelsInTile |= 1;
-
-                  unsigned int color = pgm_read_word(&tsColors[pixel]);
-                  color = ( ( color >> 8 ) | ( color << 8 ) );
+                  unsigned int color = sramPalettes[l][pixel];
                   for(unsigned o = 0; o < batchLen; o++){
                     if(!bufferX[tileBatches[o]])
                       bufferX[tileBatches[o]] = color;
@@ -336,7 +334,7 @@ void renderLayers_debug(int debug_mode) {
                       break;
                     case 6: ///////////////////////////// GRAYSCALE MODE
                       if(!bufferX[tileBatches[o]]){
-                        unsigned int color = pgm_read_word(&tsColors[pixel]);
+                        unsigned int color = sramPalettes[l][pixel];
                         unsigned int r_col = color >> 11           ; // 25.0% red
                         unsigned int g_col = color >>  5 & 0b111111; // 50.0% green
                         unsigned int b_col = color >>  1 & 0b001111; // 12.5% blue
@@ -614,10 +612,22 @@ void setup() {
 
   tft.setRotation(ORIENTATION); // Adjust orientation as needed (0 to 3)
   tft.fillScreen(TFT_BLACK);
+
+  // PRE-CACHE AND PRE-SWAP PALETTES
+  for (int l = 0; l < 4; l++) {
+    const uint16_t *flashColors = layers[l].mapData->tileset->colors;
+    for (int i = 0; i < 256; i++) {
+      uint16_t rawColor = pgm_read_word(&flashColors[i]);
+      // Store the already-swapped color directly into SRAM
+      sramPalettes[l][i] = (rawColor >> 8) | (rawColor << 8); 
+    }
+  }
+
   delay(1000);
 
   lastMillis = millis()*framerate;
   lastMillis3 = millis();
+  cameraAutoScroll = true;
 }
 
 void loop() {
