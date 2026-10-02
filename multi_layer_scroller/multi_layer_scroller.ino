@@ -164,6 +164,7 @@ void renderLayers_debug(int debug_mode) {
       unsigned int startBufferX = 16 - col_pos_off[l];
       uint16_t *bufferX = &rowDest[startBufferX];
       uint8_t *fullRowCache = (uint8_t*)&tileChunksRow[l][0];
+      uint16_t *palette = &sramPalettes[l][0];
 
       // Hold opaque pixel bits of currently rendered tile
       // and store it into the array for whole screen tiles row
@@ -239,18 +240,7 @@ void renderLayers_debug(int debug_mode) {
             }
             uint8_t *tsPixels = (uint8_t*)&pixelsChunk;
             if(!debug_mode){
-              if(!enable_occlusion){
-                for(unsigned int m = 0; m < 4; m++){
-                  unsigned int pixel = tsPixels[m];
-                  // check for 1 pixel skip
-                  if(!pixel){ bufferX++; continue; }
-                  unsigned int color = sramPalettes[l][pixel];
-                  for(unsigned o = 0; o < batchLen; o++)
-                    bufferX[tileBatches[o]] = color;
-                  bufferX++;
-                }
-              }
-              else if ( directWrite ) {
+              if ( directWrite ) {
                 // guaranteed to be one only tile
                 for(unsigned int m = 0; m < 4; m++){
                   unsigned int pixel = tsPixels[m];
@@ -258,7 +248,7 @@ void renderLayers_debug(int debug_mode) {
                   // check for 1 pixel skip
                   if(!pixel){ bufferX++; continue; }
                   opaquePixelsInTile |= 1;
-                  *bufferX++ = sramPalettes[l][pixel];
+                  *bufferX++ = palette[pixel];
                 }
               }else{
                 // render batches of tiles
@@ -268,7 +258,7 @@ void renderLayers_debug(int debug_mode) {
                   // check for 1 pixel skip
                   if(!pixel){ bufferX++; continue; }
                   opaquePixelsInTile |= 1;
-                  unsigned int color = sramPalettes[l][pixel];
+                  unsigned int color = palette[pixel];
                   for(unsigned o = 0; o < batchLen; o++){
                     if(!bufferX[tileBatches[o]])
                       bufferX[tileBatches[o]] = color;
@@ -334,7 +324,8 @@ void renderLayers_debug(int debug_mode) {
                       break;
                     case 6: ///////////////////////////// GRAYSCALE MODE
                       if(!bufferX[tileBatches[o]]){
-                        unsigned int color = sramPalettes[l][pixel];
+                        unsigned int color = palette[pixel]        ;
+                        color = ( ( color >> 8 ) | ( color << 8 ) );
                         unsigned int r_col = color >> 11           ; // 25.0% red
                         unsigned int g_col = color >>  5 & 0b111111; // 50.0% green
                         unsigned int b_col = color >>  1 & 0b001111; // 12.5% blue
